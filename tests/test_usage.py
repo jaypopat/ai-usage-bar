@@ -6,7 +6,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from ai_usage_bar import UsageClient, compact_tokens, lane_label, parse_claude, parse_codex, remaining_text
+from ai_usage_bar import (
+    UsageClient,
+    compact_tokens,
+    lane_label,
+    parse_claude,
+    parse_codex,
+    remaining_text,
+    updated_text,
+)
 
 
 class UsageParsingTests(unittest.TestCase):
@@ -53,6 +61,13 @@ class UsageParsingTests(unittest.TestCase):
         now = datetime(2026, 7, 15, 12, 0, tzinfo=timezone.utc)
         reset = datetime(2026, 7, 16, 14, 30, tzinfo=timezone.utc)
         self.assertEqual(remaining_text(reset, now), "resets in 1d 2h")
+
+    def test_updated_text(self):
+        now = datetime(2026, 7, 15, 12, 0, tzinfo=timezone.utc)
+        self.assertEqual(updated_text(now, now), "Updated just now")
+        self.assertEqual(updated_text(datetime(2026, 7, 15, 11, 57, tzinfo=timezone.utc), now), "Updated 3 min ago")
+        self.assertEqual(updated_text(datetime(2026, 7, 15, 10, 0, tzinfo=timezone.utc), now), "Updated 2h ago")
+        self.assertEqual(updated_text(None), "Updated")
 
     def test_friendly_missing_credentials(self):
         with tempfile.TemporaryDirectory() as directory:

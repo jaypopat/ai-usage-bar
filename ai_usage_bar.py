@@ -243,7 +243,9 @@ class UsageClient:
         if self._cost_cache and time.monotonic() - self._cost_cached_at < 600:
             return self._cost_cache
         helper = shutil.which("codexbar")
-        bundled = self.home / ".local/share/ai-usage-bar/bin/codexbar"
+        xdg_data = os.environ.get("XDG_DATA_HOME")
+        data_home = Path(xdg_data) if xdg_data else self.home / ".local/share"
+        bundled = data_home / "ai-usage-bar/bin/codexbar"
         if helper is None and bundled.is_file():
             helper = str(bundled)
         if helper is None:
@@ -353,7 +355,7 @@ class UsageLane(QWidget):
             self.bar.setProperty("level", "warn")
         layout.addWidget(self.bar)
         details = QHBoxLayout()
-        percent = QLabel(f"{max(0, 100 - quota.used):.0f}% left")
+        percent = QLabel(f"{max(0, min(100, quota.used)):.0f}% used")
         percent.setObjectName("usageMeta")
         self.reset = QLabel()
         self.reset.setObjectName("usageMeta")
@@ -366,6 +368,20 @@ class UsageLane(QWidget):
 
     def update_time(self) -> None:
         self.reset.setText(remaining_text(self.quota.resets_at))
+
+
+def updated_text(when: datetime | None, now: datetime | None = None) -> str:
+    if when is None:
+        return "Updated"
+    now = now or datetime.now(timezone.utc)
+    seconds = max(0, int((now - when.astimezone(timezone.utc)).total_seconds()))
+    if seconds < 45:
+        return "Updated just now"
+    minutes = round(seconds / 60)
+    if minutes < 60:
+        return f"Updated {minutes} min ago"
+    hours = round(minutes / 60)
+    return f"Updated {hours}h ago"
 
 
 def compact_tokens(tokens: int) -> str:
@@ -430,10 +446,11 @@ class ProviderCard(QFrame):
         identity.setSpacing(0)
         title = QLabel(usage.name)
         title.setObjectName("provider")
-        status = QLabel("●  Unavailable" if usage.error else "●  Updated just now")
-        status.setObjectName("statusError" if usage.error else "statusGood")
+        self.has_error = bool(usage.error)
+        self.status = QLabel("●  Unavailable" if usage.error else "●  Updated just now")
+        self.status.setObjectName("statusError" if usage.error else "statusGood")
         identity.addWidget(title)
-        identity.addWidget(status)
+        identity.addWidget(self.status)
         header.addLayout(identity)
         header.addStretch()
         if usage.plan:
@@ -521,6 +538,10 @@ class ProviderCard(QFrame):
             layout.addWidget(ModelHeader())
             for model in usage.local_usage.models[:5]:
                 layout.addWidget(ModelRow(model))
+
+    def set_updated(self, text: str) -> None:
+        if not self.has_error:
+            self.status.setText(f"●  {text}")
 
     @staticmethod
     def _divider() -> QFrame:
@@ -619,6 +640,7 @@ class UsagePopup(QWidget):
         self.loading.setMinimumHeight(112)
         self.content_layout.addWidget(self.loading)
         self.cards: list[ProviderCard] = []
+        self.updated_at: datetime | None = None
         self.current_filter = "claude"
         self.footer = QFrame()
         self.footer.setObjectName("footerFrame")
@@ -652,6 +674,7 @@ class UsagePopup(QWidget):
             self.loading.hide()
 
     def set_data(self, providers: list[ProviderUsage]) -> None:
+        self.updated_at = datetime.now(timezone.utc)
         self.setMinimumHeight(0)
         self.setMaximumHeight(16_777_215)
         for card in self.cards:
@@ -673,6 +696,7 @@ class UsagePopup(QWidget):
             card.setFixedHeight(stable_card_height)
         self.loading.hide()
         self.footer.show()
+        self._apply_updated()
         self.set_filter(self.current_filter)
         self.adjustSize()
         self.setFixedHeight(self.sizeHint().height())
@@ -685,7 +709,13 @@ class UsagePopup(QWidget):
         for card in self.cards:
             card.setVisible(card.property("providerName") == selected)
 
+    def _apply_updated(self) -> None:
+        text = updated_text(self.updated_at)
+        for card in self.cards:
+            card.set_updated(text)
+
     def update_times(self) -> None:
+        self._apply_updated()
         for card in self.cards:
             for lane in card.lanes:
                 lane.update_time()
@@ -832,21 +862,21 @@ QFrame#providerSection { background: transparent; border: none; }
 QFrame#footerFrame { background: transparent; border: none; }
 QFrame#divider { color: palette(midlight); max-height: 1px; border: none; background: palette(midlight); }
 QFrame#nav { background: transparent; border: none; }
-QFrame#usageGroup { background: palette(highlight); border: none; border-radius: 7px; }
-QFrame#usageDivider { background: rgba(255, 255, 255, 48); border: none; margin-left: 10px; margin-right: 10px; }
+QFrame#usageGroup { background: palette(alternate-base); border: 1px solid palette(midlight); border-radius: 7px; }
+QFrame#usageDivider { background: rgba(127, 127, 127, 45); border: none; margin-left: 10px; margin-right: 10px; }
 QFrame#statePanel { background: palette(alternate-base); border: 1px solid palette(midlight); border-radius: 7px; }
 QWidget#usageLane { background: transparent; }
-QLabel#usageLaneName { color: palette(highlighted-text); font-size: 13px; font-weight: 650; }
-QLabel#usageMeta { color: palette(highlighted-text); font-size: 9px; }
+QLabel#usageLaneName { color: palette(text); font-size: 13px; font-weight: 650; }
+QLabel#usageMeta { color: palette(placeholder-text); font-size: 10px; }
 QToolButton#providerTab { background: transparent; border: none; border-radius: 7px; padding: 3px 10px; color: palette(placeholder-text); font-size: 10px; }
 QToolButton#providerTab:hover { color: palette(text); background: palette(alternate-base); }
 QToolButton#providerTab:checked { background: palette(highlight); color: palette(highlighted-text); font-weight: 650; }
 QProgressBar { background: palette(midlight); border: none; border-radius: 3px; }
 QProgressBar::chunk { background: palette(highlight); border-radius: 3px; }
-QProgressBar#quotaBar { background: rgba(255, 255, 255, 58); border: none; border-radius: 2px; }
-QProgressBar#quotaBar::chunk { background: white; border-radius: 2px; }
-QProgressBar#quotaBar[level="warn"]::chunk { background: #ffd08a; }
-QProgressBar#quotaBar[level="critical"]::chunk { background: #ff9ca8; }
+QProgressBar#quotaBar { background: rgba(127, 127, 127, 55); border: none; border-radius: 2px; }
+QProgressBar#quotaBar::chunk { background: #27ae60; border-radius: 2px; }
+QProgressBar#quotaBar[level="warn"]::chunk { background: #e8a33d; }
+QProgressBar#quotaBar[level="critical"]::chunk { background: #e0455e; }
 QProgressBar#tabMeter { background: palette(midlight); border-radius: 1px; }
 QProgressBar#tabMeter::chunk { background: palette(highlight); border-radius: 1px; }
 QPushButton#iconButton { border: none; border-radius: 7px; background: transparent; }
