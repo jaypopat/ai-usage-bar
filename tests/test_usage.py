@@ -87,10 +87,11 @@ class UsageParsingTests(unittest.TestCase):
                 self.assertEqual(client.claude().plan, "Max 5×")
 
     def test_codexbar_cost_output_is_mapped_to_models(self):
+        today = datetime.now().astimezone().date().isoformat()
         payload = json.dumps([{
             "provider": "codex", "historyDays": 30,
             "totals": {"totalCost": 3.5, "totalTokens": 12000},
-            "daily": [{"totalCost": 1.25, "totalTokens": 4000, "modelBreakdowns": [
+            "daily": [{"date": today, "totalCost": 1.25, "totalTokens": 4000, "modelBreakdowns": [
                 {"modelName": "gpt-test", "totalTokens": 12000, "cost": 3.5}
             ]}],
         }])
@@ -101,6 +102,8 @@ class UsageParsingTests(unittest.TestCase):
         self.assertEqual(usage.cost, 3.5)
         self.assertEqual(usage.today_cost, 1.25)
         self.assertEqual(usage.today_tokens, 4000)
+        self.assertEqual(usage.daily[0].date, today)
+        self.assertEqual(usage.daily[0].models[0].name, "gpt-test")
         self.assertEqual(usage.models[0].name, "gpt-test")
         self.assertEqual(compact_tokens(usage.tokens), "12.0K")
 

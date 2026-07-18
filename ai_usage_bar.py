@@ -12,7 +12,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +34,7 @@ from PyQt6.QtGui import QAction, QColor, QCursor, QIcon, QPainter, QPalette, QPi
 from PyQt6.QtWidgets import (
     QApplication,
     QButtonGroup,
+    QComboBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -43,6 +44,7 @@ from PyQt6.QtWidgets import (
     QSizePolicy,
     QSystemTrayIcon,
     QToolButton,
+    QToolTip,
     QVBoxLayout,
     QWidget,
 )
@@ -70,6 +72,14 @@ class ModelBreakdown:
 
 
 @dataclass
+class DailyUsage:
+    date: str
+    cost: float
+    tokens: int
+    models: list[ModelBreakdown] = field(default_factory=list)
+
+
+@dataclass
 class LocalUsage:
     cost: float
     tokens: int
@@ -77,6 +87,7 @@ class LocalUsage:
     history_days: int = 30
     today_cost: float = 0.0
     today_tokens: int = 0
+    daily: list[DailyUsage] = field(default_factory=list)
 
 
 @dataclass
@@ -264,20 +275,39 @@ class UsageClient:
                 provider = str(item.get("provider") or "")
                 totals = item.get("totals") or {}
                 models: dict[str, ModelBreakdown] = {}
+                daily: list[DailyUsage] = []
                 for day in item.get("daily") or []:
+                    day_models: list[ModelBreakdown] = []
                     for model in day.get("modelBreakdowns") or []:
                         name = str(model.get("modelName") or "Unknown")
-                        current = models.get(name, ModelBreakdown(name, 0, 0.0))
-                        current.tokens += int(model.get("totalTokens") or 0)
-                        current.cost += float(model.get("cost") or 0)
-                        models[name] = current
+                        tokens = int(model.get("totalTokens") or 0)
+                        cost = float(model.get("cost") or 0)
+                        day_models.append(ModelBreakdown(name, tokens, cost))
+                        aggregate = models.get(name, ModelBreakdown(name, 0, 0.0))
+                        aggregate.tokens += tokens
+                        aggregate.cost += cost
+                        models[name] = aggregate
+                    date = str(day.get("date") or "")
+                    if date:
+                        daily.append(
+                            DailyUsage(
+                                date,
+                                float(day.get("totalCost") or 0),
+                                int(day.get("totalTokens") or 0),
+                                sorted(day_models, key=lambda model: model.cost, reverse=True),
+                            )
+                        )
+                daily.sort(key=lambda day: day.date)
+                today_date = datetime.now().astimezone().date().isoformat()
+                today = next((day for day in reversed(daily) if day.date == today_date), None)
                 parsed[provider] = LocalUsage(
                     cost=float(totals.get("totalCost") or item.get("last30DaysCostUSD") or 0),
                     tokens=int(totals.get("totalTokens") or item.get("last30DaysTokens") or 0),
                     models=sorted(models.values(), key=lambda model: model.cost, reverse=True),
                     history_days=int(item.get("historyDays") or 30),
-                    today_cost=float((item.get("daily") or [{}])[-1].get("totalCost") or 0),
-                    today_tokens=int((item.get("daily") or [{}])[-1].get("totalTokens") or 0),
+                    today_cost=today.cost if today else 0.0,
+                    today_tokens=today.tokens if today else 0,
+                    daily=daily,
                 )
             if parsed:
                 self._cost_cache = parsed
@@ -392,24 +422,116 @@ def compact_tokens(tokens: int) -> str:
     return str(tokens)
 
 
+def daily_label(day: DailyUsage) -> str:
+    try:
+        selected = datetime.fromisoformat(day.date).date()
+    except ValueError:
+        return day.date
+    today = datetime.now().astimezone().date()
+    if selected == today:
+        return "Today"
+    if (today - selected).days == 1:
+        return "Yesterday"
+    return selected.strftime("%a, %-d %b")
+
+
 class ModelRow(QWidget):
-    def __init__(self, model: ModelBreakdown, parent: QWidget | None = None):
+    def __init__(self, model: ModelBreakdown | None = None, parent: QWidget | None = None):
         super().__init__(parent)
+        self.setFixedHeight(23)
         row = QHBoxLayout(self)
         row.setContentsMargins(0, 4, 0, 4)
         row.setSpacing(10)
-        name = QLabel(model.name)
-        name.setObjectName("modelName")
-        tokens = QLabel(f"{compact_tokens(model.tokens)} tokens")
-        tokens.setObjectName("modelTokens")
-        tokens.setFixedWidth(92)
-        tokens.setAlignment(Qt.AlignmentFlag.AlignRight)
-        cost = QLabel(f"${model.cost:,.2f}")
-        cost.setObjectName("modelCost")
-        cost.setAlignment(Qt.AlignmentFlag.AlignRight)
-        row.addWidget(name, 1)
-        row.addWidget(tokens)
-        row.addWidget(cost)
+        self.name = QLabel()
+        self.name.setObjectName("modelName")
+        self.tokens = QLabel()
+        self.tokens.setObjectName("modelTokens")
+        self.tokens.setFixedWidth(92)
+        self.tokens.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self.cost = QLabel()
+        self.cost.setObjectName("modelCost")
+        self.cost.setAlignment(Qt.AlignmentFlag.AlignRight)
+        row.addWidget(self.name, 1)
+        row.addWidget(self.tokens)
+        row.addWidget(self.cost)
+        self.set_model(model)
+
+    def set_model(self, model: ModelBreakdown | None) -> None:
+        self.name.setText(model.name if model else "")
+        self.tokens.setText(f"{compact_tokens(model.tokens)} tokens" if model else "")
+        self.cost.setText(f"${model.cost:,.2f}" if model else "")
+
+
+class ActivityHeatmap(QWidget):
+    day_selected = pyqtSignal(str)
+
+    def __init__(self, daily: list[DailyUsage], parent: QWidget | None = None):
+        super().__init__(parent)
+        self.daily = {day.date: day for day in daily}
+        self.today = datetime.now().astimezone().date()
+        self.start = self.today - timedelta(days=34)
+        self.selected_date = self.today.isoformat()
+        self.setObjectName("activityHeatmap")
+        self.setFixedSize(82, 58)
+        self.setMouseTracking(True)
+
+    def _cell_rect(self, index: int) -> QRect:
+        column, row = divmod(index, 7)
+        return QRect(2 + column * 16, 2 + row * 8, 12, 5)
+
+    def _day_at(self, position: QPoint) -> tuple[str, DailyUsage | None] | None:
+        for index in range(35):
+            if self._cell_rect(index).contains(position):
+                day = self.start + timedelta(days=index)
+                date = day.isoformat()
+                return date, self.daily.get(date)
+        return None
+
+    def paintEvent(self, a0: Any) -> None:
+        del a0
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        maximum = max((day.tokens for day in self.daily.values()), default=0)
+        base = QApplication.palette().color(QApplication.palette().ColorRole.Midlight)
+        accent = QColor("#27ae60")
+        for index in range(35):
+            date = (self.start + timedelta(days=index)).isoformat()
+            day = self.daily.get(date)
+            color = QColor(base)
+            if day and day.tokens > 0 and maximum > 0:
+                strength = 0.26 + 0.74 * (day.tokens / maximum) ** 0.45
+                color = QColor(accent)
+                color.setAlpha(round(255 * strength))
+            rect = self._cell_rect(index)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(color)
+            painter.drawRoundedRect(rect, 2, 2)
+            if date == self.selected_date:
+                painter.setPen(QApplication.palette().color(QApplication.palette().ColorRole.Highlight))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawRoundedRect(rect.adjusted(-1, -1, 1, 1), 3, 3)
+        painter.end()
+
+    def mouseMoveEvent(self, a0: Any) -> None:
+        result = self._day_at(a0.position().toPoint())
+        if result is None:
+            QToolTip.hideText()
+            return
+        date, day = result
+        if day:
+            text = f"{daily_label(day)} · ${day.cost:,.2f} · {compact_tokens(day.tokens)} tokens"
+        else:
+            text = f"{date} · no recorded activity"
+        QToolTip.showText(a0.globalPosition().toPoint(), text, self)
+
+    def mousePressEvent(self, a0: Any) -> None:
+        result = self._day_at(a0.position().toPoint())
+        if result and result[1]:
+            self.day_selected.emit(result[0])
+
+    def set_selected_date(self, date: str) -> None:
+        self.selected_date = date
+        self.update()
 
 
 class ModelHeader(QWidget):
@@ -514,17 +636,40 @@ class ProviderCard(QFrame):
             layout.addLayout(reset_row)
         if usage.local_usage:
             layout.addWidget(self._divider())
+            if usage.local_usage.daily:
+                activity_row = QHBoxLayout()
+                activity_copy = QVBoxLayout()
+                activity_copy.setSpacing(0)
+                activity_title = QLabel("Activity")
+                activity_title.setObjectName("sectionTitle")
+                activity_hint = QLabel(f"Last {usage.local_usage.history_days} days · local history")
+                activity_hint.setObjectName("muted")
+                activity_copy.addWidget(activity_title)
+                activity_copy.addWidget(activity_hint)
+                self.heatmap = ActivityHeatmap(usage.local_usage.daily)
+                self.heatmap.day_selected.connect(self._select_heatmap_day)
+                activity_row.addLayout(activity_copy)
+                activity_row.addStretch()
+                activity_row.addWidget(self.heatmap)
+                layout.addLayout(activity_row)
             cost_header = QHBoxLayout()
             cost_title = QLabel("Cost")
             cost_title.setObjectName("sectionTitle")
             cost_header.addWidget(cost_title)
             cost_header.addStretch()
+            self.day_picker: QComboBox | None = None
+            self.day_entries = list(reversed(usage.local_usage.daily))
+            if self.day_entries:
+                self.day_picker = QComboBox()
+                self.day_picker.setObjectName("dayPicker")
+                for day in self.day_entries:
+                    self.day_picker.addItem(daily_label(day))
+                self.day_picker.setToolTip("Choose a day from local usage history")
+                self.day_picker.currentIndexChanged.connect(self._set_selected_day)
+                cost_header.addWidget(self.day_picker)
             layout.addLayout(cost_header)
-            today = QLabel(
-                f"Today: ${usage.local_usage.today_cost:,.2f} · "
-                f"{compact_tokens(usage.local_usage.today_tokens)} tokens"
-            )
-            today.setObjectName("costLine")
+            self.selected_day_line = QLabel()
+            self.selected_day_line.setObjectName("costLine")
             period_label = (
                 f"Last {usage.local_usage.history_days} days" if usage.local_usage.history_days else "All time"
             )
@@ -533,11 +678,43 @@ class ProviderCard(QFrame):
                 f"{compact_tokens(usage.local_usage.tokens)} tokens"
             )
             total.setObjectName("costLine")
-            layout.addWidget(today)
+            layout.addWidget(self.selected_day_line)
             layout.addWidget(total)
             layout.addWidget(ModelHeader())
-            for model in usage.local_usage.models[:5]:
-                layout.addWidget(ModelRow(model))
+            self.model_rows = [ModelRow() for _ in range(5)]
+            for row in self.model_rows:
+                layout.addWidget(row)
+            if self.day_entries:
+                self._set_selected_day(0)
+            else:
+                self.selected_day_line.setText(
+                    f"Today: ${usage.local_usage.today_cost:,.2f} · "
+                    f"{compact_tokens(usage.local_usage.today_tokens)} tokens"
+                )
+                self._set_models(usage.local_usage.models)
+
+    def _set_selected_day(self, index: int) -> None:
+        if not (0 <= index < len(self.day_entries)):
+            return
+        day = self.day_entries[index]
+        self.selected_day_line.setText(
+            f"{daily_label(day)}: ${day.cost:,.2f} · {compact_tokens(day.tokens)} tokens"
+        )
+        if hasattr(self, "heatmap"):
+            self.heatmap.set_selected_date(day.date)
+        self._set_models(day.models)
+
+    def _select_heatmap_day(self, date: str) -> None:
+        for index, day in enumerate(self.day_entries):
+            if day.date == date and self.day_picker is not None:
+                self.day_picker.setCurrentIndex(index)
+                return
+
+    def _set_models(self, models: list[ModelBreakdown]) -> None:
+        for row, model in zip(self.model_rows, models[: len(self.model_rows)]):
+            row.set_model(model)
+        for row in self.model_rows[len(models) :]:
+            row.set_model(None)
 
     def set_updated(self, text: str) -> None:
         if not self.has_error:
@@ -858,6 +1035,10 @@ QLabel#modelName { font-size: 10px; }
 QLabel#modelTokens { color: palette(placeholder-text); font-size: 9px; }
 QLabel#modelCost { font-family: "Noto Sans Mono"; font-size: 10px; font-weight: 600; min-width: 48px; }
 QLabel#footer { color: palette(placeholder-text); font-size: 8px; padding-top: 3px; }
+QComboBox#dayPicker { background: palette(alternate-base); border: 1px solid palette(midlight); border-radius: 5px; padding: 2px 6px; font-size: 10px; min-width: 96px; }
+QComboBox#dayPicker:hover { border-color: palette(highlight); }
+QComboBox#dayPicker::drop-down { border: none; width: 18px; }
+QComboBox#dayPicker QAbstractItemView { background: palette(base); border: 1px solid palette(mid); selection-background-color: palette(highlight); selection-color: palette(highlighted-text); }
 QFrame#providerSection { background: transparent; border: none; }
 QFrame#footerFrame { background: transparent; border: none; }
 QFrame#divider { color: palette(midlight); max-height: 1px; border: none; background: palette(midlight); }
@@ -897,7 +1078,8 @@ def main() -> int:
     lock = QLockFile(str(Path(runtime_dir) / f"{APP_ID}.lock"))
     lock.setStaleLockTime(0)
     if not lock.tryLock(100):
-        return 0
+        if not lock.removeStaleLockFile() or not lock.tryLock(100):
+            return 0
     if not QSystemTrayIcon.isSystemTrayAvailable():
         print("AI Usage Bar: no system tray is available", file=sys.stderr)
         return 1
