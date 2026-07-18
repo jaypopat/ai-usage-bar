@@ -5,6 +5,17 @@ already maintained by the two CLIs, fetches their usage endpoints every two minu
 in memory. Five-hour, daily, weekly, and model-specific Codex lanes are supported whenever the provider
 reports them. There is no account setup, database, analytics, helper daemon, or browser-cookie access.
 
+## Screenshots
+
+<p align="center">
+  <img src="docs/screenshots/claude.png" alt="Claude usage popup" width="45%" />
+  <img src="docs/screenshots/codex.png" alt="Codex usage popup" width="45%" />
+</p>
+
+The popup keeps the important details within reach: live quota windows and reset times, plan status,
+reset credits, local cost and token totals, per-model breakdowns, selectable daily history, and a compact
+activity grid. Screenshots use redacted local usage values.
+
 ## Run
 
 Requirements: Linux, Python 3.11+, PyQt6, and KDE Plasma (tested on Plasma 6 / Wayland).
