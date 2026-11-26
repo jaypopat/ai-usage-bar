@@ -1,9 +1,10 @@
 # AI Usage Bar
 
-A tiny KDE Plasma tray utility for Claude Code and OpenAI Codex quota windows. It reads the sessions
-already maintained by the two CLIs, fetches their usage endpoints every two minutes, and keeps all data
-in memory. Five-hour, daily, weekly, and model-specific Codex lanes are supported whenever the provider
-reports them. There is no account setup, database, analytics, helper daemon, or browser-cookie access.
+A tiny KDE Plasma tray utility for Claude Code, OpenAI Codex, and Google Antigravity quota windows. It reads the
+existing local sessions for each provider, fetches their usage endpoints every two minutes, and keeps all data in
+memory. Five-hour, daily, weekly, model-specific Codex lanes, and Antigravity model family buckets are supported
+whenever the provider reports them. There is no account setup, database, analytics, helper daemon, or
+browser-cookie access.
 
 ## Screenshots
 
@@ -25,8 +26,8 @@ Requirements: Linux, Python 3.11+, PyQt6, and KDE Plasma (tested on Plasma 6 / W
 ```
 
 Click the tray meter for the compact details popup. The fixed-size provider switcher opens on Claude
-and switches to Codex without moving or resizing the popup; right-click the tray icon for refresh and
-quit. A runtime lock ensures only one copy can run per desktop session.
+and switches between Claude, Codex, and Antigravity without moving or resizing the popup; right-click
+the tray icon for refresh and quit. A runtime lock ensures only one copy can run per desktop session.
 
 ## Install and start at login
 
@@ -43,10 +44,14 @@ it is not another resident service. Cost results are cached for ten minutes.
 
 ## Privacy and credentials
 
-The app reads `~/.claude/.credentials.json` and `~/.codex/auth.json` without modifying them. Tokens are
-used only as authorization headers for `api.anthropic.com/api/oauth/usage` and
-`chatgpt.com/backend-api/wham/usage`. They are never logged or stored by this app. If a session expires,
-sign in again with `claude` or `codex login`; the next refresh picks up the new credentials.
+The app reads `~/.claude/.credentials.json`, `~/.codex/auth.json`, and local Antigravity OAuth token files
+(`~/.t3/userdata/providers/antigravity/*/antigravity-acp/acp_token.json`, `antigravity-oauth-token`, or
+`ANTIGRAVITY_TOKEN_PATH`) without modifying them. Tokens are used only as authorization headers for
+`api.anthropic.com/api/oauth/usage`, `chatgpt.com/backend-api/wham/usage`,
+`daily-cloudcode-pa.googleapis.com`, and `cloudcode-pa.googleapis.com` (plus `oauth2.googleapis.com/token`
+in memory when refreshing an Antigravity refresh token). They are never logged or stored by this app. If a
+session expires, sign in again with `claude`, `codex login`, or Antigravity; the next refresh picks up the
+new credentials.
 
 ## Test
 

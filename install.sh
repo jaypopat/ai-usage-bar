@@ -9,13 +9,13 @@ autostart_dir="${XDG_CONFIG_HOME:-$HOME/.config}/autostart"
 
 mkdir -p "$app_dir/assets" "$bin_dir" "$applications_dir" "$autostart_dir"
 install -m 755 "$root/ai_usage_bar.py" "$app_dir/ai_usage_bar.py"
-install -m 644 "$root/assets/claude.svg" "$root/assets/openai.svg" "$app_dir/assets/"
+install -m 644 "$root/assets/claude.svg" "$root/assets/openai.svg" "$root/assets/antigravity.svg" "$app_dir/assets/"
 ln -sfn "$app_dir/ai_usage_bar.py" "$bin_dir/ai-usage-bar"
 
 desktop="[Desktop Entry]
 Type=Application
 Name=AI Usage Bar
-Comment=Claude Code and Codex quota meter
+Comment=Claude Code, Codex, and Antigravity quota meter
 Exec=$bin_dir/ai-usage-bar
 Icon=office-chart-bar
 Terminal=false

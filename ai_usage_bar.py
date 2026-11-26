@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
-"""A small, local-first Claude Code and Codex tray meter for KDE Plasma."""
+"""A small, local-first Claude Code, Codex, and Antigravity tray meter for KDE Plasma."""
 
 from __future__ import annotations
 
+import hashlib
+import http.client
 import json
+import math
 import os
+import platform
 import shutil
 import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -55,6 +60,38 @@ VERSION = "0.3.0"
 REFRESH_MS = 120_000
 ASSET_DIR = Path(__file__).resolve().parent / "assets"
 
+ANTIGRAVITY_ENDPOINTS = (
+    "https://daily-cloudcode-pa.googleapis.com",
+    "https://cloudcode-pa.googleapis.com",
+)
+ANTIGRAVITY_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
+ANTIGRAVITY_CLIENT_METADATA = {
+    "ideType": "ANTIGRAVITY",
+    "platform": "PLATFORM_UNSPECIFIED",
+    "pluginType": "GEMINI",
+}
+
+
+def _antigravity_user_agent() -> str:
+    machine = platform.machine().lower()
+    arch = "arm64" if machine in ("aarch64", "arm64") else "amd64"
+    return f"antigravity/hub/2.9.1 (aidev_client; os_type=linux; arch={arch})"
+
+
+@dataclass(frozen=True)
+class ProviderSpec:
+    key: str
+    label: str
+    icon_asset: str
+
+
+PROVIDERS: tuple[ProviderSpec, ...] = (
+    ProviderSpec("claude", "Claude", "claude.svg"),
+    ProviderSpec("codex", "Codex", "openai.svg"),
+    ProviderSpec("antigravity", "Antigravity", "antigravity.svg"),
+)
+PROVIDER_MAP: dict[str, ProviderSpec] = {spec.key: spec for spec in PROVIDERS}
+
 
 @dataclass
 class UsageWindow:
@@ -62,6 +99,7 @@ class UsageWindow:
     used: float
     resets_at: datetime | None
     duration_seconds: int | None = None
+    starts_on_use: bool = False
 
 
 @dataclass
@@ -176,6 +214,203 @@ def parse_codex(data: dict[str, Any]) -> ProviderUsage:
     return usage
 
 
+def _parse_remaining_fraction(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        fraction = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(fraction):
+        return None
+    return max(0.0, min(1.0, fraction))
+
+
+def parse_antigravity_summary(data: dict[str, Any]) -> list[tuple[str, UsageWindow]]:
+    if not isinstance(data, dict):
+        return []
+    bucket_sources: list[tuple[dict[str, Any], str]] = []
+    groups = data.get("groups")
+    if isinstance(groups, list) and groups:
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            group_name = str(group.get("displayName") or "").strip()
+            buckets = group.get("buckets")
+            if isinstance(buckets, list):
+                for bucket in buckets:
+                    if isinstance(bucket, dict):
+                        bucket_sources.append((bucket, group_name))
+    else:
+        buckets = data.get("buckets")
+        if isinstance(buckets, list):
+            for bucket in buckets:
+                if isinstance(bucket, dict):
+                    bucket_sources.append((bucket, ""))
+
+    entries: list[tuple[str, UsageWindow]] = []
+    for bucket, group_name in bucket_sources:
+        if bucket.get("disabled"):
+            continue
+        fraction = _parse_remaining_fraction(bucket.get("remainingFraction"))
+        if fraction is None:
+            continue
+        used = (1.0 - fraction) * 100.0
+        bucket_id = str(bucket.get("bucketId") or "").strip()
+        if bucket_id.startswith("gemini-"):
+            family = "Gemini"
+        elif bucket_id.startswith("3p-"):
+            family = "Claude & GPT"
+        else:
+            family = (group_name or bucket_id).strip() or "Quota"
+
+        window_kind = str(bucket.get("window") or "").strip().lower()
+        if window_kind == "5h":
+            window_label, duration_seconds = "5 hour", 5 * 3600
+        elif window_kind == "weekly":
+            window_label, duration_seconds = "Weekly", 7 * 86400
+        else:
+            window_label = str(bucket.get("displayName") or "").strip() or "Quota"
+            duration_seconds = None
+
+        entry_id = bucket_id or f"{family.lower()}-{window_label.lower()}"
+        label = f"{family} · {window_label}"
+        resets_at = parse_date(bucket.get("resetTime"))
+        entries.append(
+            (
+                entry_id,
+                UsageWindow(
+                    label,
+                    used,
+                    resets_at,
+                    duration_seconds,
+                    starts_on_use=(resets_at is None and used <= 0.0),
+                ),
+            )
+        )
+    return entries
+
+
+def _should_replace_window(existing: UsageWindow | None, candidate: UsageWindow) -> bool:
+    if existing is None or candidate.used > existing.used:
+        return True
+    return (
+        candidate.used == existing.used
+        and candidate.used > 0.0
+        and existing.resets_at is None
+        and candidate.resets_at is not None
+    )
+
+
+def parse_antigravity_models(data: dict[str, Any]) -> list[tuple[str, UsageWindow]]:
+    if not isinstance(data, dict):
+        return []
+    models = data.get("models")
+    if not isinstance(models, dict):
+        return []
+
+    merged: dict[str, UsageWindow] = {}
+    for model_id, info in models.items():
+        if not isinstance(info, dict):
+            continue
+        provider = str(info.get("modelProvider") or "").upper()
+        lower_id = str(model_id).lower()
+        if provider == "MODEL_PROVIDER_GOOGLE" or lower_id.startswith("gemini-"):
+            family = "Gemini"
+        elif provider == "MODEL_PROVIDER_ANTHROPIC" or lower_id.startswith("claude-"):
+            family = "Claude"
+        elif provider == "MODEL_PROVIDER_OPENAI" or lower_id.startswith("gpt-"):
+            family = "GPT"
+        else:
+            continue
+
+        for field_name, suffix, window_label, duration_seconds in (
+            ("quotaInfo", "quota", "Quota", None),
+            ("weeklyQuotaInfo", "weekly", "Weekly", 7 * 86400),
+        ):
+            quota = info.get(field_name)
+            if not isinstance(quota, dict):
+                continue
+            fraction = _parse_remaining_fraction(quota.get("remainingFraction"))
+            if fraction is None:
+                continue
+            used = (1.0 - fraction) * 100.0
+            bucket_id = f"{family.lower()}-{suffix}"
+            candidate = UsageWindow(
+                f"{family} · {window_label}",
+                used,
+                parse_date(quota.get("resetTime")),
+                duration_seconds,
+            )
+            if _should_replace_window(merged.get(bucket_id), candidate):
+                merged[bucket_id] = candidate
+    return list(merged.items())
+
+
+def merge_antigravity_windows(entries: list[tuple[str, UsageWindow]]) -> list[UsageWindow]:
+    merged: dict[str, UsageWindow] = {}
+    for bucket_id, window in entries:
+        if _should_replace_window(merged.get(bucket_id), window):
+            merged[bucket_id] = window
+
+    duration_order = {5 * 3600: 0, 86400: 1, 7 * 86400: 2}
+
+    def sort_key(item: tuple[str, UsageWindow]) -> tuple[int, int, str]:
+        bucket_id, window = item
+        if bucket_id.startswith("gemini-"):
+            family_rank = 0
+        elif bucket_id.startswith("3p-"):
+            family_rank = 1
+        elif bucket_id.startswith("claude-"):
+            family_rank = 2
+        elif bucket_id.startswith("gpt-"):
+            family_rank = 3
+        else:
+            family_rank = 4
+        return (family_rank, duration_order.get(window.duration_seconds or 0, 3), window.label)
+
+    return [window for _bucket_id, window in sorted(merged.items(), key=sort_key)]
+
+
+def parse_antigravity_plan(data: dict[str, Any], has_active_five_hour: bool = False) -> str | None:
+    if not isinstance(data, dict):
+        return None
+    paid_tier = data.get("paidTier")
+    if isinstance(paid_tier, dict):
+        paid_name = str(paid_tier.get("name") or "").strip()
+        if paid_name:
+            return paid_name
+    current_tier = data.get("currentTier")
+    if isinstance(current_tier, dict):
+        tier_id = str(current_tier.get("id") or "").strip()
+        tier_name = str(current_tier.get("name") or "").strip()
+        if tier_id == "free-tier" and has_active_five_hour:
+            return None
+        if tier_name and tier_name != "Antigravity":
+            return tier_name
+    return None
+
+
+class _SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        origin = urllib.parse.urlsplit(req.full_url)
+        target = urllib.parse.urlsplit(urllib.parse.urljoin(req.full_url, newurl))
+        if (origin.scheme, origin.netloc) != (target.scheme, target.netloc):
+            raise urllib.error.URLError("Cross-origin redirect blocked")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_HTTP_OPENER = urllib.request.build_opener(_SameOriginRedirectHandler())
+
+
 class UsageClient:
     """Reads existing CLI credentials and fetches only provider quota endpoints."""
 
@@ -184,11 +419,38 @@ class UsageClient:
         self.timeout = timeout
         self._cost_cache: dict[str, LocalUsage] = {}
         self._cost_cached_at = 0.0
+        self._antigravity_token_cache: tuple[str, str, float] | None = None
+
+    def _open_json(self, request: urllib.request.Request) -> Any:
+        try:
+            with _HTTP_OPENER.open(request, timeout=self.timeout) as response:
+                return json.load(response)
+        except http.client.HTTPException as error:
+            raise urllib.error.URLError(error) from error
 
     def _json_request(self, url: str, headers: dict[str, str]) -> dict[str, Any]:
         request = urllib.request.Request(url, headers={"Accept": "application/json", **headers})
-        with urllib.request.urlopen(request, timeout=self.timeout) as response:
-            return json.load(response)
+        return self._open_json(request)
+
+    def _json_post(self, url: str, headers: dict[str, str], body: dict[str, Any]) -> dict[str, Any]:
+        payload = json.dumps(body).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=payload,
+            headers={"Accept": "application/json", "Content-Type": "application/json", **headers},
+            method="POST",
+        )
+        return self._open_json(request)
+
+    def _form_post(self, url: str, form: dict[str, str]) -> dict[str, Any]:
+        payload = urllib.parse.urlencode(form).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=payload,
+            headers={"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        )
+        return self._open_json(request)
 
     def claude(self) -> ProviderUsage:
         try:
@@ -243,8 +505,262 @@ class UsageClient:
         except (urllib.error.URLError, TimeoutError, OSError):
             return ProviderUsage("Codex", error="Could not reach OpenAI")
 
+    def _refresh_antigravity_acp_token(self, path: Path, payload: dict[str, Any]) -> tuple[str, str | None]:
+        client_id = str(payload.get("client_id") or "").strip()
+        client_secret = str(payload.get("client_secret") or "").strip()
+        refresh_token = str(payload.get("refresh_token") or "").strip()
+        if not (client_id and client_secret and refresh_token):
+            raise KeyError("missing refresh credentials")
+        project_id = str(payload.get("project_id") or "").strip() or None
+        stat = path.stat()
+        digest = hashlib.sha256(refresh_token.encode("utf-8")).hexdigest()[:16]
+        fingerprint = f"{path}:{stat.st_mtime_ns}:{stat.st_size}:{digest}"
+        now_mono = time.monotonic()
+        if (
+            self._antigravity_token_cache is not None
+            and self._antigravity_token_cache[0] == fingerprint
+            and now_mono < self._antigravity_token_cache[2] - 60.0
+        ):
+            return self._antigravity_token_cache[1], project_id
+        refreshed = self._form_post(
+            ANTIGRAVITY_OAUTH_TOKEN_URL,
+            {
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "refresh_token": refresh_token,
+                "grant_type": "refresh_token",
+            },
+        )
+        if not isinstance(refreshed, dict):
+            raise TypeError("invalid refresh response")
+        access_token = str(refreshed.get("access_token") or "").strip()
+        if not access_token:
+            raise KeyError("missing access_token in refresh response")
+        raw_expires = refreshed.get("expires_in")
+        expires_in = float(raw_expires) if isinstance(raw_expires, (int, float)) and not isinstance(raw_expires, bool) else 3600.0
+        self._antigravity_token_cache = (fingerprint, access_token, time.monotonic() + expires_in)
+        return access_token, project_id
+
+    @staticmethod
+    def _extract_oauth_token(payload: dict[str, Any]) -> tuple[str, datetime | None, str | None] | None:
+        token_block = payload.get("token")
+        if not isinstance(token_block, dict):
+            return None
+        access_token = str(token_block.get("access_token") or "").strip()
+        if not access_token:
+            return None
+        expiry = parse_date(token_block.get("expiry"))
+        project_id = str(payload.get("project_id") or token_block.get("project_id") or "").strip() or None
+        return access_token, expiry, project_id
+
+    def _resolve_antigravity_token(self) -> tuple[str, str | None]:
+        explicit = os.environ.get("ANTIGRAVITY_TOKEN_PATH")
+        if explicit:
+            path = Path(explicit)
+            payload = json.loads(path.read_text())
+            if not isinstance(payload, dict):
+                raise KeyError("invalid token file")
+            if "refresh_token" in payload:
+                return self._refresh_antigravity_acp_token(path, payload)
+            extracted = self._extract_oauth_token(payload)
+            if extracted is None:
+                raise KeyError("missing access_token")
+            return extracted[0], extracted[2]
+
+        acp_paths = sorted(
+            (p for p in self.home.glob(".t3/userdata/providers/antigravity/*/antigravity-acp/acp_token.json") if p.is_file()),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        oauth_paths = [
+            p
+            for p in (
+                *self.home.glob(".t3/userdata/providers/antigravity/*/antigravity-acp/antigravity-oauth-token"),
+                self.home / ".gemini/antigravity/antigravity-oauth-token",
+                self.home / ".gemini/antigravity-cli/antigravity-oauth-token",
+            )
+            if p.is_file()
+        ]
+        if not acp_paths and not oauth_paths:
+            raise FileNotFoundError("no Antigravity credential files found")
+
+        auth_error: urllib.error.HTTPError | None = None
+        network_error: Exception | None = None
+        parse_error: Exception | None = None
+        for path in acp_paths:
+            try:
+                payload = json.loads(path.read_text())
+                if not isinstance(payload, dict):
+                    raise KeyError("invalid acp_token.json")
+                return self._refresh_antigravity_acp_token(path, payload)
+            except urllib.error.HTTPError as err:
+                auth_error = auth_error or err
+            except (urllib.error.URLError, TimeoutError, OSError) as err:
+                network_error = network_error or err
+            except (KeyError, json.JSONDecodeError, ValueError, TypeError) as err:
+                parse_error = parse_error or err
+
+        now = datetime.now(timezone.utc)
+        oauth_candidates: list[tuple[int, float, float, str, str | None]] = []
+        for path in oauth_paths:
+            try:
+                payload = json.loads(path.read_text())
+                if not isinstance(payload, dict):
+                    raise KeyError("invalid oauth token file")
+                extracted = self._extract_oauth_token(payload)
+                if extracted is None:
+                    raise KeyError("missing access_token")
+                access_token, expiry, project_id = extracted
+                if expiry is not None:
+                    expiry_utc = (
+                        expiry.astimezone(timezone.utc)
+                        if expiry.tzinfo is not None
+                        else expiry.replace(tzinfo=timezone.utc)
+                    )
+                    is_valid = 1 if expiry_utc > now else 0
+                    expiry_ts = expiry_utc.timestamp()
+                else:
+                    is_valid = 0
+                    expiry_ts = float("-inf")
+                oauth_candidates.append((is_valid, expiry_ts, path.stat().st_mtime, access_token, project_id))
+            except (KeyError, json.JSONDecodeError, ValueError, TypeError, OSError) as err:
+                parse_error = parse_error or err
+
+        if oauth_candidates:
+            oauth_candidates.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+            best = oauth_candidates[0]
+            return best[3], best[4]
+        if auth_error is not None:
+            raise auth_error
+        if network_error is not None:
+            raise network_error
+        if parse_error is not None:
+            raise parse_error
+        raise FileNotFoundError("no Antigravity credential files found")
+
+    def antigravity(self) -> ProviderUsage:
+        try:
+            access_token, project_id = self._resolve_antigravity_token()
+        except FileNotFoundError:
+            return ProviderUsage("Antigravity", error="Not signed in — open Antigravity or sign in via T3 Code")
+        except (KeyError, json.JSONDecodeError, ValueError, TypeError):
+            return ProviderUsage("Antigravity", error="Antigravity credentials are unavailable")
+        except urllib.error.HTTPError as error:
+            message = (
+                "Session expired — open Antigravity to refresh"
+                if error.code in (400, 401, 403)
+                else f"Service returned HTTP {error.code}"
+            )
+            return ProviderUsage("Antigravity", error=message)
+        except (urllib.error.URLError, TimeoutError, OSError):
+            return ProviderUsage("Antigravity", error="Could not reach Google")
+
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "User-Agent": _antigravity_user_agent(),
+        }
+
+        code_assist: dict[str, Any] = {}
+        permission_denied = False
+        try:
+            response = self._json_post(
+                f"{ANTIGRAVITY_ENDPOINTS[0]}/v1internal:loadCodeAssist",
+                headers,
+                {"metadata": ANTIGRAVITY_CLIENT_METADATA},
+            )
+            if isinstance(response, dict):
+                code_assist = response
+                if not project_id:
+                    project_field = response.get("cloudaicompanionProject")
+                    if isinstance(project_field, str) and project_field.strip():
+                        project_id = project_field.strip()
+                    elif isinstance(project_field, dict):
+                        nested_id = str(project_field.get("id") or "").strip()
+                        if nested_id:
+                            project_id = nested_id
+        except urllib.error.HTTPError as error:
+            if error.code == 401:
+                self._antigravity_token_cache = None
+                return ProviderUsage("Antigravity", error="Session expired — open Antigravity to refresh")
+            if error.code == 403:
+                permission_denied = True
+        except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError, ValueError, TypeError):
+            pass
+
+        quota_body: dict[str, Any] = {"project": project_id} if project_id else {}
+        entries: list[tuple[str, UsageWindow]] = []
+        unauthorized = False
+        http_error_code: int | None = None
+        network_errors = 0
+        summary_valid = 0
+
+        for endpoint in ANTIGRAVITY_ENDPOINTS:
+            try:
+                payload = self._json_post(f"{endpoint}/v1internal:retrieveUserQuotaSummary", headers, quota_body)
+                if isinstance(payload, dict) and ("groups" in payload or "buckets" in payload):
+                    summary_valid += 1
+                    entries.extend(parse_antigravity_summary(payload))
+            except urllib.error.HTTPError as error:
+                if error.code == 401:
+                    unauthorized = True
+                elif error.code == 403:
+                    permission_denied = True
+                else:
+                    http_error_code = error.code
+            except (urllib.error.URLError, TimeoutError, OSError):
+                network_errors += 1
+            except (json.JSONDecodeError, ValueError, TypeError):
+                pass
+
+        if not entries:
+            if unauthorized:
+                self._antigravity_token_cache = None
+                return ProviderUsage("Antigravity", error="Session expired — open Antigravity to refresh")
+            if summary_valid == 0 and network_errors == len(ANTIGRAVITY_ENDPOINTS):
+                return ProviderUsage("Antigravity", error="Could not reach Google")
+
+            fallback_valid = 0
+            fallback_network_errors = 0
+            fallback_http_error: int | None = None
+            for endpoint in ANTIGRAVITY_ENDPOINTS:
+                try:
+                    payload = self._json_post(f"{endpoint}/v1internal:fetchAvailableModels", headers, quota_body)
+                    if isinstance(payload, dict) and isinstance(payload.get("models"), dict):
+                        fallback_valid += 1
+                        entries.extend(parse_antigravity_models(payload))
+                except urllib.error.HTTPError as error:
+                    if error.code == 401:
+                        unauthorized = True
+                    elif error.code == 403:
+                        permission_denied = True
+                    else:
+                        fallback_http_error = error.code
+                        http_error_code = error.code
+                except (urllib.error.URLError, TimeoutError, OSError):
+                    fallback_network_errors += 1
+                except (json.JSONDecodeError, ValueError, TypeError):
+                    pass
+
+            if not entries:
+                if unauthorized:
+                    self._antigravity_token_cache = None
+                    return ProviderUsage("Antigravity", error="Session expired — open Antigravity to refresh")
+                if fallback_valid == 0:
+                    if fallback_http_error is not None or http_error_code is not None:
+                        code = fallback_http_error if fallback_http_error is not None else http_error_code
+                        return ProviderUsage("Antigravity", error=f"Service returned HTTP {code}")
+                    if permission_denied:
+                        return ProviderUsage("Antigravity", error="Antigravity quota access denied")
+                    if summary_valid == 0 or fallback_network_errors == len(ANTIGRAVITY_ENDPOINTS):
+                        return ProviderUsage("Antigravity", error="Could not reach Google")
+
+        windows = merge_antigravity_windows(entries)
+        has_active_five_hour = any(window.duration_seconds == 5 * 3600 for window in windows)
+        plan = parse_antigravity_plan(code_assist, has_active_five_hour)
+        return ProviderUsage("Antigravity", plan=plan, windows=windows)
+
     def fetch(self) -> list[ProviderUsage]:
-        providers = [self.claude(), self.codex()]
+        providers = [self.claude(), self.codex(), self.antigravity()]
         costs = self.cost_usage()
         for provider in providers:
             provider.local_usage = costs.get(provider.name.lower())
@@ -342,7 +858,11 @@ class FetchWorker(QRunnable):
         self.signals = WorkerSignals()
 
     def run(self) -> None:
-        self.signals.done.emit(self.client.fetch())
+        try:
+            providers = self.client.fetch()
+        except Exception:
+            providers = [ProviderUsage(spec.label, error="Refresh failed") for spec in PROVIDERS]
+        self.signals.done.emit(providers)
 
 
 def remaining_text(reset: datetime | None, now: datetime | None = None) -> str:
@@ -397,7 +917,10 @@ class UsageLane(QWidget):
         self.update_time()
 
     def update_time(self) -> None:
-        self.reset.setText(remaining_text(self.quota.resets_at))
+        if self.quota.resets_at is None and self.quota.starts_on_use:
+            self.reset.setText("starts on use")
+        else:
+            self.reset.setText(remaining_text(self.quota.resets_at))
 
 
 def updated_text(when: datetime | None, now: datetime | None = None) -> str:
@@ -692,6 +1215,7 @@ class ProviderCard(QFrame):
                     f"{compact_tokens(usage.local_usage.today_tokens)} tokens"
                 )
                 self._set_models(usage.local_usage.models)
+        layout.addStretch(1)
 
     def _set_selected_day(self, index: int) -> None:
         if not (0 <= index < len(self.day_entries)):
@@ -729,8 +1253,10 @@ class ProviderCard(QFrame):
 
 
 def provider_icon(provider: str) -> QIcon:
-    asset_name = "claude.svg" if provider == "claude" else "openai.svg"
-    source = QPixmap(str(ASSET_DIR / asset_name))
+    spec = PROVIDER_MAP.get(provider)
+    if spec is None:
+        return QIcon.fromTheme("applications-development")
+    source = QPixmap(str(ASSET_DIR / spec.icon_asset))
     if source.isNull():
         return QIcon.fromTheme("applications-development")
 
@@ -781,33 +1307,34 @@ class UsagePopup(QWidget):
         self.tabs.setExclusive(True)
         self.tab_buttons: dict[str, QToolButton] = {}
         self.tab_bars: dict[str, QProgressBar] = {}
-        for key, text in (("claude", "Claude"), ("codex", "Codex")):
+        default_key = PROVIDERS[0].key
+        for spec in PROVIDERS:
             tab = QWidget()
             tab_layout = QVBoxLayout(tab)
             tab_layout.setContentsMargins(0, 0, 0, 0)
             tab_layout.setSpacing(2)
             button = QToolButton()
             button.setObjectName("providerTab")
-            button.setText(text)
-            button.setIcon(provider_icon(key))
+            button.setText(spec.label)
+            button.setIcon(provider_icon(spec.key))
             button.setIconSize(QSize(21, 21))
             button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
             button.setCheckable(True)
             button.setFixedHeight(52)
             button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-            button.clicked.connect(lambda _checked, selected=key: self.set_filter(selected))
+            button.clicked.connect(lambda _checked, selected=spec.key: self.set_filter(selected))
             self.tabs.addButton(button)
-            self.tab_buttons[key] = button
+            self.tab_buttons[spec.key] = button
             meter = QProgressBar()
             meter.setObjectName("tabMeter")
             meter.setRange(0, 100)
             meter.setTextVisible(False)
             meter.setFixedHeight(2)
-            self.tab_bars[key] = meter
+            self.tab_bars[spec.key] = meter
             tab_layout.addWidget(button)
             tab_layout.addWidget(meter)
             nav_layout.addWidget(tab)
-            if key == "claude":
+            if spec.key == default_key:
                 button.setChecked(True)
         self.content_layout.addWidget(nav)
         self.content_layout.addWidget(ProviderCard._divider())
@@ -818,7 +1345,7 @@ class UsagePopup(QWidget):
         self.content_layout.addWidget(self.loading)
         self.cards: list[ProviderCard] = []
         self.updated_at: datetime | None = None
-        self.current_filter = "claude"
+        self.current_filter = default_key
         self.footer = QFrame()
         self.footer.setObjectName("footerFrame")
         footer_layout = QHBoxLayout(self.footer)
@@ -998,21 +1525,36 @@ class TrayApp(QObject):
         foreground = QApplication.palette().color(QApplication.palette().ColorRole.WindowText)
         muted = QColor(foreground)
         muted.setAlpha(65)
-        values = []
-        for provider in providers[:2]:
-            values.append(max((window.used for window in provider.windows), default=0) if not provider.error else -1)
-        while len(values) < 2:
-            values.append(0)
+        if providers:
+            values = [
+                max((window.used for window in provider.windows), default=0.0) if not provider.error else -1.0
+                for provider in providers
+            ]
+        else:
+            values = [0.0] * len(PROVIDERS)
+        count = len(values)
+        if count == 1:
+            bar_height, gap = 12, 0
+        elif count == 2:
+            bar_height, gap = 10, 6
+        elif count == 3:
+            bar_height, gap = 8, 4
+        else:
+            gap = 3
+            bar_height = max(4, (size - 12 - gap * (count - 1)) // count)
+        total_height = count * bar_height + max(0, count - 1) * gap
+        top = (size - total_height) // 2
+        radius = bar_height / 2
         painter.setPen(Qt.PenStyle.NoPen)
         for index, value in enumerate(values):
-            rect = QRect(5, 8 + index * 16, 34, 10)
+            rect = QRect(5, top + index * (bar_height + gap), 34, bar_height)
             painter.setBrush(muted)
-            painter.drawRoundedRect(rect, 5, 5)
+            painter.drawRoundedRect(rect, radius, radius)
             fill = QRect(rect)
-            fill.setWidth(max(4, round(rect.width() * max(0, value) / 100)))
+            fill.setWidth(max(4, round(rect.width() * max(0.0, min(100.0, value)) / 100.0)))
             color = QColor("#da4453") if value < 0 or value >= 90 else QColor("#f67400") if value >= 70 else foreground
             painter.setBrush(color)
-            painter.drawRoundedRect(fill, 5, 5)
+            painter.drawRoundedRect(fill, radius, radius)
         painter.end()
         return QIcon(pixmap)
 
